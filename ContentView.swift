@@ -3,16 +3,13 @@ import AVFoundation
 import UniformTypeIdentifiers
 import AppKit
 
-// MARK: - Auto Clipper (Production Final v4)
-// Single-file macOS video clipping tool
-// Features:
-// - Sequential export pipeline
-// - Real AVAssetExportSession KVO progress tracking
-// - Cancellation support
-// - Smoothed ETA + elapsed time
-// - Improved clip segmentation (adaptive heuristic)
-// - Modern macOS SwiftUI layout
-// - Thread-safe logging
+// MARK: - Auto Clipper (Production Final v5)
+// Updates:
+// - Clips now ~90 seconds each
+// - Export now goes to Movies/AutoClipper folder (not temp)
+// - Auto directory creation
+// - Sequential export unchanged
+// - KVO progress tracking preserved
 
 // MARK: - Stage
 
@@ -81,7 +78,7 @@ final class ClipViewModel: ObservableObject {
         log("Selected: \(url.lastPathComponent)")
     }
 
-    // MARK: Clip Detection (simple adaptive)
+    // MARK: Clip Detection (~90s segments)
 
     func detectClips(asset: AVAsset) async throws -> [Clip] {
         let duration = try await asset.load(.duration)
@@ -90,17 +87,31 @@ final class ClipViewModel: ObservableObject {
         var result: [Clip] = []
         var t: Double = 0
 
-        let base = 10.0
-        let max = 25.0
+        let base = 90.0
+        let variance = 15.0
 
         while t < seconds {
-            let segment = min(base + Double.random(in: 0...5), max)
-            let end = min(t + segment, seconds)
+            let segment = base + Double.random(in: -variance...variance)
+            let safeSegment = max(60, min(segment, 120))
+            let end = min(t + safeSegment, seconds)
             result.append(Clip(start: t, end: end))
             t = end
         }
 
         return result
+    }
+
+    // MARK: Export Folder
+
+    func exportFolder() throws -> URL {
+        let movies = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first!
+        let folder = movies.appendingPathComponent("AutoClipper")
+
+        if !FileManager.default.fileExists(atPath: folder.path) {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+
+        return folder
     }
 
     // MARK: Run
@@ -128,6 +139,8 @@ final class ClipViewModel: ObservableObject {
             clips = try await detectClips(asset: asset)
             log("Clips detected: \(clips.count)")
 
+            let outputFolder = try exportFolder()
+
             stage = .exporting
 
             for (i, clip) in clips.enumerated() {
@@ -136,7 +149,7 @@ final class ClipViewModel: ObservableObject {
                 currentClipText = "\(i+1)/\(clips.count)"
                 timeRangeText = "\(Int(clip.start))s - \(Int(clip.end))s"
 
-                try await export(asset: asset, clip: clip, index: i)
+                try await export(asset: asset, clip: clip, index: i, folder: outputFolder)
 
                 progress = Double(i+1) / Double(clips.count)
                 updateTime()
@@ -156,18 +169,15 @@ final class ClipViewModel: ObservableObject {
         isRunning = false
     }
 
-    // MARK: Export with REAL KVO progress
+    // MARK: Export
 
-    func export(asset: AVAsset, clip: Clip, index: Int) async throws {
+    func export(asset: AVAsset, clip: Clip, index: Int, folder: URL) async throws {
 
         let composition = AVMutableComposition()
 
         guard let track = try await asset.loadTracks(withMediaType: .video).first else { return }
 
-        let compTrack = composition.addMutableTrack(
-            withMediaType: .video,
-            preferredTrackID: kCMPersistentTrackID_Invalid
-        )
+        let compTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
 
         let start = CMTime(seconds: clip.start, preferredTimescale: 600)
         let duration = CMTime(seconds: clip.end - clip.start, preferredTimescale: 600)
@@ -178,13 +188,11 @@ final class ClipViewModel: ObservableObject {
             at: .zero
         )
 
-        guard let exporter = AVAssetExportSession(
-            asset: composition,
-            presetName: AVAssetExportPresetHighestQuality
-        ) else { return }
+        guard let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality) else {
+            return
+        }
 
-        let out = FileManager.default.temporaryDirectory
-            .appendingPathComponent("clip_\(index).mp4")
+        let out = folder.appendingPathComponent("clip_\(index+1).mp4")
 
         exporter.outputURL = out
         exporter.outputFileType = .mp4
@@ -192,7 +200,6 @@ final class ClipViewModel: ObservableObject {
 
         log("Exporting clip \(index+1)")
 
-        // KVO progress tracking
         observation = exporter.observe(\AVAssetExportSession.progress, options: [.new]) { [weak self] exporter, _ in
             Task { @MainActor in
                 guard let self else { return }
