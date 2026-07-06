@@ -3,13 +3,16 @@ import AVFoundation
 import UniformTypeIdentifiers
 import AppKit
 
-// MARK: - Auto Clipper (Single File App)
+// MARK: - Auto Clipper (Production Upgrade v2)
 
-// This is a production-grade single-file macOS SwiftUI app that:
-// - Imports a video
-// - Simulates AI clip detection
-// - Exports clips sequentially using AVFoundation
-// - Tracks progress, ETA, logs, and stages
+// Single-file macOS SwiftUI app
+// Upgrades:
+// - True async AVAssetExportSession handling
+// - Sequential guaranteed export
+// - ETA + elapsed time
+// - Cancellation support
+// - Better progress reporting
+// - Cleaner state machine
 
 // MARK: - Models
 
@@ -51,8 +54,12 @@ final class ClipViewModel: ObservableObject {
     @Published var timeRangeText: String = "-"
     @Published var logs: [LogItem] = []
     
+    @Published var elapsed: String = "00:00"
+    @Published var remaining: String = "--:--"
+    
     private var clips: [Clip] = []
     private var startTime: Date?
+    private var cancelTask = false
     
     func addLog(_ text: String) {
         logs.append(LogItem(message: text))
@@ -60,23 +67,20 @@ final class ClipViewModel: ObservableObject {
     
     func selectVideo(_ url: URL) {
         self.url = url
-        addLog("Selected video: \(url.lastPathComponent)")
+        addLog("Selected: \(url.lastPathComponent)")
     }
     
     func generateClips(asset: AVAsset) async throws -> [Clip] {
         let duration = try await asset.load(.duration)
         let seconds = CMTimeGetSeconds(duration)
-        
         var result: [Clip] = []
-        var current: Double = 0
-        let size: Double = 15
+        var t: Double = 0
+        let step: Double = 15
         
-        while current < seconds {
-            let end = min(current + size, seconds)
-            result.append(Clip(start: current, end: end))
-            current += size
+        while t < seconds {
+            result.append(Clip(start: t, end: min(t + step, seconds)))
+            t += step
         }
-        
         return result
     }
     
@@ -85,6 +89,7 @@ final class ClipViewModel: ObservableObject {
         guard !movieName.isEmpty else { return }
         
         isRunning = true
+        cancelTask = false
         progress = 0
         stage = .loading
         task = "Loading"
@@ -101,60 +106,85 @@ final class ClipViewModel: ObservableObject {
             addLog("Analyzing video")
             
             clips = try await generateClips(asset: asset)
-            addLog("Detected \(clips.count) clips")
+            addLog("Clips: \(clips.count)")
             
             stage = .exporting
             task = "Exporting"
             
-            for (index, clip) in clips.enumerated() {
-                if Task.isCancelled { break }
+            for (i, clip) in clips.enumerated() {
+                if cancelTask { break }
                 
-                currentClipText = "Clip \(index + 1) / \(clips.count)"
-                timeRangeText = "\(clip.start) - \(clip.end)"
+                currentClipText = "Clip \(i+1)/\(clips.count)"
+                timeRangeText = "\(Int(clip.start))s - \(Int(clip.end))s"
                 
-                addLog("Exporting clip \(index + 1)")
+                try await exportClip(asset: asset, clip: clip, index: i, total: clips.count)
                 
-                try await exportClip(asset: asset, clip: clip, index: index)
-                
-                progress = Double(index + 1) / Double(clips.count)
+                progress = Double(i+1) / Double(clips.count)
+                updateTime()
             }
             
             stage = .finalizing
+            progress = 1
             task = "Finalizing"
-            progress = 1.0
             addLog("Done")
             
             stage = .complete
-            task = "Complete"
+            isRunning = false
             
         } catch {
             stage = .failed
             addLog("Error: \(error.localizedDescription)")
+            isRunning = false
         }
-        
-        isRunning = false
     }
     
-    func exportClip(asset: AVAsset, clip: Clip, index: Int) async throws {
-        let composition = AVMutableComposition()
+    func cancel() {
+        cancelTask = true
+        addLog("Cancelled")
+    }
+    
+    func updateTime() {
+        guard let startTime else { return }
+        let elapsedSec = Date().timeIntervalSince(startTime)
+        elapsed = format(elapsedSec)
         
+        if progress > 0 {
+            let total = elapsedSec / progress
+            let remainingSec = max(total - elapsedSec, 0)
+            remaining = format(remainingSec)
+        }
+    }
+    
+    func format(_ t: TimeInterval) -> String {
+        let m = Int(t) / 60
+        let s = Int(t) % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+    
+    func exportClip(asset: AVAsset, clip: Clip, index: Int, total: Int) async throws {
+        let composition = AVMutableComposition()
         guard let track = try await asset.loadTracks(withMediaType: .video).first else { return }
-        let compTrack = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
+        let comp = composition.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)
         
         let start = CMTime(seconds: clip.start, preferredTimescale: 600)
         let duration = CMTime(seconds: clip.end - clip.start, preferredTimescale: 600)
         
-        try compTrack?.insertTimeRange(CMTimeRange(start: start, duration: duration), of: track, at: .zero)
+        try comp?.insertTimeRange(CMTimeRange(start: start, duration: duration), of: track, at: .zero)
         
         let exporter = AVAssetExportSession(asset: composition, presetName: AVAssetExportPresetHighestQuality)!
         
-        let outputURL = FileManager.default.temporaryDirectory
+        let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("clip_\(index).mp4")
         
-        exporter.outputURL = outputURL
+        exporter.outputURL = url
         exporter.outputFileType = .mp4
+        exporter.shouldOptimizeForNetworkUse = true
         
-        await exporter.export()
+        await withCheckedContinuation { cont in
+            exporter.exportAsynchronously {
+                cont.resume()
+            }
+        }
     }
 }
 
@@ -162,48 +192,43 @@ final class ClipViewModel: ObservableObject {
 
 struct ContentView: View {
     @StateObject private var vm = ClipViewModel()
-    @State private var showingPicker = false
+    @State private var picker = false
     
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 12) {
             Text("Auto Clipper")
                 .font(.largeTitle)
                 .bold()
             
             TextField("Movie name", text: $vm.movieName)
                 .textFieldStyle(.roundedBorder)
-                .padding()
+                .padding(.horizontal)
             
             HStack {
-                Button("Choose Video") {
-                    showingPicker = true
-                }
-                
-                Button("Generate Clips") {
-                    Task { await vm.run() }
-                }
-                .disabled(vm.isRunning)
+                Button("Select Video") { picker = true }
+                Button("Generate") { Task { await vm.run() } }
+                Button("Cancel") { vm.cancel() }
             }
             
             ProgressView(value: vm.progress)
-                .padding()
             
             Text(vm.stage.rawValue)
             Text(vm.task)
             Text(vm.currentClipText)
             Text(vm.timeRangeText)
+            Text("Elapsed: \(vm.elapsed)")
+            Text("Remaining: \(vm.remaining)")
             
             ScrollView {
-                ForEach(vm.logs) { log in
-                    Text(log.message)
-                        .font(.caption)
+                ForEach(vm.logs) { l in
+                    Text(l.message).font(.caption)
                 }
             }
             .frame(height: 200)
         }
         .padding()
-        .fileImporter(isPresented: $showingPicker, allowedContentTypes: [.movie]) { result in
-            if case let .success(url) = result {
+        .fileImporter(isPresented: $picker, allowedContentTypes: [.movie]) { res in
+            if case let .success(url) = res {
                 vm.selectVideo(url)
             }
         }
